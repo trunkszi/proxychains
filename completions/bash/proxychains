@@ -1,0 +1,111 @@
+# bash completion for proxychains
+
+_proxychains_option_takes_value() {
+  case "$1" in
+    -f|--file|-p|--proxy|-u|--uid|-g|--gid) return 0 ;;
+  esac
+  return 1
+}
+
+_proxychains() {
+  local cur prev words cword
+  if declare -F _init_completion >/dev/null 2>&1; then
+    _init_completion -n : || return
+  else
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    words=("${COMP_WORDS[@]}")
+    cword=$COMP_CWORD
+  fi
+
+  local i=1
+  local command_index=0
+  while [ "$i" -lt "$cword" ]; do
+    local word="${words[i]}"
+    if [ "$word" = "--" ]; then
+      command_index=$((i + 1))
+      break
+    fi
+    case "$word" in
+      --file=*|--proxy=*|--uid=*|--gid=*)
+        i=$((i + 1))
+        ;;
+      -*)
+        if _proxychains_option_takes_value "$word"; then
+          i=$((i + 2))
+        elif [ "${word#-}" != "$word" ] && [ "${word#--}" = "$word" ]; then
+          local cluster="${word#-}"
+          local prefix="${cluster%?}"
+          local last="${cluster#"${prefix}"}"
+          case "$prefix" in
+            *[fpug]*)
+              i=$((i + 1))
+              ;;
+            *)
+              case "$last" in
+                f|p|u|g) i=$((i + 2)) ;;
+                *) i=$((i + 1)) ;;
+              esac
+              ;;
+          esac
+        else
+          i=$((i + 1))
+        fi
+        ;;
+      *)
+        command_index=$i
+        break
+        ;;
+    esac
+  done
+
+  if [ "$command_index" -gt 0 ] && [ "$command_index" -le "$cword" ]; then
+    if declare -F _command_offset >/dev/null 2>&1; then
+      _command_offset "$command_index"
+    elif [ "$cword" -eq "$command_index" ]; then
+      COMPREPLY=( $(compgen -c -- "$cur") )
+    else
+      COMPREPLY=( $(compgen -f -- "$cur") )
+    fi
+    return 0
+  fi
+
+  case "$prev" in
+    -f|--file|-*[qvh]f)
+      if declare -F _filedir >/dev/null 2>&1; then
+        _filedir '@(yaml|yml|conf)'
+      else
+        COMPREPLY=( $(compgen -f -- "$cur") )
+      fi
+      return 0
+      ;;
+    -p|--proxy|-*[qvh]p)
+      COMPREPLY=( $(compgen -W 'socks5:// socks4:// http:// raw://' -- "$cur") )
+      return 0
+      ;;
+    -u|--uid|-g|--gid|-*[qvh]u|-*[qvh]g)
+      return 0
+      ;;
+  esac
+
+  if [ "${cur#--proxy=}" != "$cur" ]; then
+    local scheme
+    COMPREPLY=()
+    for scheme in socks5:// socks4:// http:// raw://; do
+      case "$scheme" in
+        "${cur#--proxy=}"*) COMPREPLY+=("--proxy=${scheme}") ;;
+      esac
+    done
+    return 0
+  fi
+
+  if [ "${cur#-}" != "$cur" ]; then
+    COMPREPLY=( $(compgen -W '-q --quiet -f --file -p --proxy -u --uid -g --gid -v --version -h --help' -- "$cur") )
+    return 0
+  fi
+
+  COMPREPLY=( $(compgen -c -- "$cur") )
+}
+
+complete -F _proxychains proxychains

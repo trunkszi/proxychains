@@ -1,0 +1,16 @@
+#compdef proxychains
+
+_proxychains_proxy_prefixes() {
+  compadd -S '' 'socks5://' 'socks4://' 'http://' 'raw://'
+}
+
+_arguments -s -S \
+  '(-q --quiet)'{-q,--quiet}'[Quiet mode]' \
+  '(-f --file)'{-f,--file}'[Configuration file path]:config:_files -g "*.(yaml|yml|conf)(-.)"' \
+  '(-p --proxy)'{-p,--proxy}'[Direct proxy URL]:proxy:_proxychains_proxy_prefixes' \
+  '(-u --uid)'{-u,--uid}'[Fake UID]:uid:' \
+  '(-g --gid)'{-g,--gid}'[Fake GID]:gid:' \
+  '(-v --version)'{-v,--version}'[Show version]' \
+  '(-h --help)'{-h,--help}'[Show help]' \
+  '(-)1:command:_command_names -e' \
+  '*::arguments:_normal'

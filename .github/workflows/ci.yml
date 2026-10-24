@@ -1,0 +1,228 @@
+name: CI and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish"
+        required: false
+        default: "v0.0.1"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_OPTIONS: --no-deprecation
+  TAR_OPTIONS: --no-same-owner
+
+jobs:
+  build:
+    name: Build & Test (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="${INPUT_TAG}"
+          else
+            LATEST_TAG="$(git tag -l 'v[0-9]*' --sort=-v:refname | head -n1)"
+            TAG="${LATEST_TAG:-v0.0.1}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install system build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential git pkg-config curl tar xz-utils unzip zip
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Cache xmake packages
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.xmake/cache
+            ~/.xmake/packages
+          key: xmake-${{ matrix.target }}-${{ hashFiles('xmake.lua', 'tests/xmake.lua') }}
+          restore-keys: |
+            xmake-${{ matrix.target }}-
+
+      - name: Configure and install dependencies
+        run: |
+          xmake f -m release -y
+          xmake require -y
+
+      - name: Build all targets and tests
+        run: |
+          xmake build -y proxychains-lib proxychains-cli proxychains-daemon
+          xmake build -y -g tests
+
+      - name: Run unit and E2E test suites
+        run: |
+          xmake test -vD
+
+      - name: Stage and package release archive
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          STAGE_DIR="dist/proxychains-${RELEASE_VERSION}-${{ matrix.target }}"
+          rm -rf dist
+          mkdir -p "$STAGE_DIR"
+
+          xmake install -o "$STAGE_DIR" proxychains-lib
+          xmake install -o "$STAGE_DIR" proxychains-cli
+          xmake install -o "$STAGE_DIR" proxychains-daemon
+
+          test -f "$STAGE_DIR/bin/proxychains"
+          test -f "$STAGE_DIR/bin/proxychains-daemon"
+          test -f "$STAGE_DIR/lib/libproxychains.so"
+          test -f "$STAGE_DIR/etc/proxychains.yaml"
+          test -f "$STAGE_DIR/share/zsh/site-functions/_proxychains"
+          test -f "$STAGE_DIR/share/bash-completion/completions/proxychains"
+
+          ARCHIVE="proxychains-${RELEASE_VERSION}-${{ matrix.target }}.tar.gz"
+          tar -C dist -czf "dist/${ARCHIVE}" "proxychains-${RELEASE_VERSION}-${{ matrix.target }}"
+          (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          rm -rf "$STAGE_DIR"
+          ls -lh dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: proxychains-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    if: >-
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="${INPUT_TAG}"
+          else
+            LATEST_TAG="$(git tag -l 'v[0-9]*' --sort=-v:refname | head -n1)"
+            TAG="${LATEST_TAG:-v0.0.1}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: proxychains-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum proxychains-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -lh
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "Nathan Shea"
+          git config user.email "itzrustz@gmail.com"
+          if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
+            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              EXISTING_SHA="$(git rev-list -n 1 "refs/tags/$TAG")"
+              if [[ "$EXISTING_SHA" != "${GITHUB_SHA}" && "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ]]; then
+                echo "Release tag $TAG already exists at $EXISTING_SHA; skipping tag overwrite on branch push."
+                exit 0
+              fi
+              if [[ "$EXISTING_SHA" != "${GITHUB_SHA}" ]]; then
+                git tag -fa "$TAG" -m "Release $TAG" "${GITHUB_SHA}"
+                git push origin "refs/tags/$TAG" --force
+              fi
+            else
+              git tag -a "$TAG" -m "Release $TAG" "${GITHUB_SHA}"
+              git push origin "refs/tags/$TAG"
+            fi
+          fi
+
+          cat > notes.md <<EOF
+          ## proxychains ${TAG}
+
+          Modern C++23 (\`-fno-exceptions\`) \`LD_PRELOAD\` proxy hooker for UNIX/Linux.
+
+          ### Highlights
+          - **Protocols**: SOCKS5, SOCKS4/SOCKS4a, HTTP CONNECT, and RAW chaining (\`dynamic\`, \`strict\`, \`random\`, \`round_robin\`).
+          - **Libraries**: \`glaze\` YAML configuration, \`cxxopts\` CLI parser, \`fmtlog\` logging, and \`c-ares\` DNS wire/resolver integration.
+          - **Shell Completions**: Pre-packaged Zsh (\`_proxychains\`) and Bash (\`proxychains\`) completions.
+
+          ### Assets
+          - \`proxychains-${RELEASE_VERSION}-linux-x86_64.tar.gz\`
+          - \`proxychains-${RELEASE_VERSION}-linux-aarch64.tar.gz\`
+          - \`SHA256SUMS\`
+          EOF
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "proxychains ${TAG}" --notes-file notes.md
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "proxychains ${TAG}" --notes-file notes.md dist/*
+          fi
